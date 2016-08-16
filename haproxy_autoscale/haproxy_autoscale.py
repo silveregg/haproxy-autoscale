@@ -4,6 +4,7 @@ import subprocess
 import urllib2
 
 from boto.ec2 import EC2Connection, get_region
+from boto.ec2.autoscale import AutoScaleConnection
 from mako.template import Template
 
 __version__ = '0.4.1'
@@ -29,12 +30,7 @@ def steal_elastic_ip(access_key=None, secret_key=None, ip=None):
     conn.associate_address(instance_id=instance_id, public_ip=ip)
 
 
-def get_running_instances(access_key=None, secret_key=None, security_group=None, region=None):
-    """Get all running instances. Only within a security group if specified."""
-
-    logging.debug('get_running_instances()')
-    instances_all_regions_list = []
-
+def get_ec2_connections(access_key=None, secret_key=None, region=None):
     if region is None:
         conn = EC2Connection(aws_access_key_id=access_key,
                              aws_secret_access_key=secret_key)
@@ -42,18 +38,54 @@ def get_running_instances(access_key=None, secret_key=None, security_group=None,
     else:
         ec2_region_list = [get_region(region)]
 
-    for region in ec2_region_list:
-        conn = EC2Connection(aws_access_key_id=access_key,
-                             aws_secret_access_key=secret_key,
-                             region=region)
+    return [EC2Connection(aws_access_key_id=access_key,
+                          aws_secret_access_key=secret_key,
+                          region=region)
+            for region in ec2_region_list]
 
-        running_instances = []
+
+def convert_to_asg_conn(connections):
+    asg_connections = []
+
+    for conn in connections:
+        kwargs = conn.get_params()
+        asg_connections.append(boto.ec2.autoscale.connect_to_region(
+            conn.region.name,
+            **kwargs))
+
+    return asg_connections
+
+
+def get_as_group_instances(connections, asg_connections, as_group):
+    running_instances = []
+    for conn in asg_connections:
+        instances = []
+
+        for i, asg in enumerate(conn.get_all_groups(names=[as_group])):
+            instance_ids = [x.instance_id for x in asg.instances]
+            instances = connections[i].get_only_instances(instance_ids)
+            running_instances.extend(instances)
+
+    return running_instances
+
+
+def get_sec_group_instances(connections, security_group):
+    """Get all running instances. Only within a security group if specified."""
+
+    logging.debug('get_sec_group_instances()')
+    instances_all_regions_list = []
+    running_instances = []
+
+    for conn in connections:
         try:
             for s in conn.get_all_security_groups():
                 if s.name == security_group:
                     running_instances.extend([i for i in s.instances() if i.state == 'running'])
         except boto.exception.EC2ResponseError:
-            logging.error('Region [' + region.name + '] inaccessible')
+            logging.error('EC2 error')
+            # logging.error('Region [' + region.name + '] inaccessible')
+            # TODO
+            raise
 
         if running_instances:
             for instance in running_instances:
